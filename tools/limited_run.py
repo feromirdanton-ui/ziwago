@@ -33,7 +33,10 @@ JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200
 JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100
 JOB_OBJECT_CPU_RATE_CONTROL_INFORMATION = 15
-CPU_RATE_CONTROL_ENABLE_HARD_CAP = 0x00000001
+# Значения из winnt.h: ENABLE=0x1, WEIGHT_BASED=0x2, HARD_CAP=0x4.
+# Жёсткий потолок = ENABLE | HARD_CAP; один ENABLE без режима WinAPI отвергает.
+JOB_OBJECT_CPU_RATE_CONTROL_ENABLE = 0x00000001
+JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP = 0x00000004
 CREATE_SUSPENDED = 0x00000004
 
 class IO_COUNTERS(ctypes.Structure):
@@ -67,10 +70,10 @@ class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
 
 
 class JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(ctypes.Structure):
+    # {DWORD ControlFlags; union {DWORD CpuRate; DWORD Weight; struct {WORD MinRate, MaxRate;}}} = 8 байт.
+    # CpuRate — в сотых долях процента (1..10000) при HARD_CAP.
     _fields_ = [("ControlFlags", wintypes.DWORD),
-                ("Anonymous", ctypes.c_ulonglong),
-                ("CpuRate", wintypes.DWORD),
-                ("Weight", wintypes.DWORD)]
+                ("CpuRate", wintypes.DWORD)]
 
 
 def total_physical_memory() -> tuple[int, int]:
@@ -113,7 +116,8 @@ def make_job(ram_bytes: int, cpu_pct: int) -> tuple[object, bool]:
     cpu_cap_applied = False
     if cpu_pct and cpu_pct < 100:
         cpu = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION()
-        cpu.ControlFlags = CPU_RATE_CONTROL_ENABLE_HARD_CAP | 0x00000002  # ENABLE | HARD_CAP
+        cpu.ControlFlags = (JOB_OBJECT_CPU_RATE_CONTROL_ENABLE
+                            | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP)
         cpu.CpuRate = max(1, int(cpu_pct * 100))
         cpu_cap_applied = bool(kernel32.SetInformationJobObject(
             job, JOB_OBJECT_CPU_RATE_CONTROL_INFORMATION,

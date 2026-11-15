@@ -13,6 +13,10 @@
 Лимиты по умолчанию берутся из переменных окружения ZIWAGO_RAM_PCT / ZIWAGO_CPU_PCT.
 Пороги (85 %) — из правил проекта: VRAM ≤ 85 %, RAM ≤ 85 %, CPU ≤ 85 % ядер;
 здесь по умолчанию 60 %, чтобы оставить запас пользователю.
+
+Отказ закрыт (fail closed): если лимит памяти не удалось применить (Job Object
+не назначен), процесс НЕ запускается и возвращается код 3. Запуск без лимита
+возможен только с явным флагом --allow-unlimited.
 """
 from __future__ import annotations
 
@@ -29,7 +33,10 @@ JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200
 JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100
 JOB_OBJECT_CPU_RATE_CONTROL_INFORMATION = 15
-CPU_RATE_CONTROL_ENABLE_HARD_CAP = 0x00000001
+# Значения из winnt.h: ENABLE=0x1, WEIGHT_BASED=0x2, HARD_CAP=0x4.
+# Жёсткий потолок = ENABLE | HARD_CAP; один ENABLE без режима WinAPI отвергает.
+JOB_OBJECT_CPU_RATE_CONTROL_ENABLE = 0x00000001
+JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP = 0x00000004
 CREATE_SUSPENDED = 0x00000004
 
 class IO_COUNTERS(ctypes.Structure):
@@ -63,13 +70,14 @@ class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
 
 
 class JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(ctypes.Structure):
+    # {DWORD ControlFlags; union {DWORD CpuRate; DWORD Weight; struct {WORD MinRate, MaxRate;}}} = 8 байт.
+    # CpuRate — в сотых долях процента (1..10000) при HARD_CAP.
     _fields_ = [("ControlFlags", wintypes.DWORD),
-                ("Anonymous", ctypes.c_ulonglong),
-                ("CpuRate", wintypes.DWORD),
-                ("Weight", wintypes.DWORD)]
+                ("CpuRate", wintypes.DWORD)]
 
 
-def total_physical_memory() -> int:
+def total_physical_memory() -> tuple[int, int]:
+    """Возвращает (всего физической памяти, доступно сейчас) в байтах."""
     class MEMORYSTATUSEX(ctypes.Structure):
         _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
                     ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
@@ -86,7 +94,12 @@ def cpu_count() -> int:
     return os.cpu_count() or 4
 
 
-def make_job(ram_bytes: int, cpu_pct: int):
+def make_job(ram_bytes: int, cpu_pct: int) -> tuple[object, bool]:
+    """Создаёт Job Object. Возвращает (job, cpu_cap_applied).
+
+    Лимит памяти обязателен: его отказ — исключение. Жёсткий потолок CPU
+    применяется по возможности, но результат больше не игнорируется.
+    """
     kernel32 = ctypes.windll.kernel32
     job = kernel32.CreateJobObjectW(None, None)
     if not job:
@@ -100,13 +113,16 @@ def make_job(ram_bytes: int, cpu_pct: int):
     if not kernel32.SetInformationJobObject(job, 9, ctypes.byref(limits),
                                             ctypes.sizeof(limits)):
         raise OSError("SetInformationJobObject(JobMemoryLimit) failed")
+    cpu_cap_applied = False
     if cpu_pct and cpu_pct < 100:
         cpu = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION()
-        cpu.ControlFlags = CPU_RATE_CONTROL_ENABLE_HARD_CAP
+        cpu.ControlFlags = (JOB_OBJECT_CPU_RATE_CONTROL_ENABLE
+                            | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP)
         cpu.CpuRate = max(1, int(cpu_pct * 100))
-        kernel32.SetInformationJobObject(job, JOB_OBJECT_CPU_RATE_CONTROL_INFORMATION,
-                                         ctypes.byref(cpu), ctypes.sizeof(cpu))
-    return job
+        cpu_cap_applied = bool(kernel32.SetInformationJobObject(
+            job, JOB_OBJECT_CPU_RATE_CONTROL_INFORMATION,
+            ctypes.byref(cpu), ctypes.sizeof(cpu)))
+    return job, cpu_cap_applied
 
 
 def assign(job, pid: int) -> tuple[bool, int]:
@@ -137,6 +153,10 @@ def job_peak(job) -> tuple[int, int]:
 
 
 def main() -> int:
+    if os.name != "nt":
+        print("[limited_run] поддерживается только Windows (Job Object); "
+              "на этой платформе лимит применить нельзя, запуск отменён.", file=sys.stderr)
+        return 2
     parser = argparse.ArgumentParser()
     parser.add_argument("--ram-pct", type=int,
                         default=int(os.environ.get("ZIWAGO_RAM_PCT", "60")))
@@ -148,6 +168,9 @@ def main() -> int:
                              "приложениями (у пользователя занято ~7 ГБ).")
     parser.add_argument("--cpu-pct", type=int,
                         default=int(os.environ.get("ZIWAGO_CPU_PCT", "60")))
+    parser.add_argument("--allow-unlimited", action="store_true",
+                        help="Разрешить запуск БЕЗ лимита памяти, если назначение в Job Object "
+                             "не удалось. По умолчанию такой запуск отменяется (код 3).")
     parser.add_argument("--log", type=str, default=None)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -158,7 +181,7 @@ def main() -> int:
     cap_total = int(total * max(5, min(95, args.ram_pct)) / 100)
     cap_free = int(avail * max(5, min(100, args.ram_free_pct)) / 100)
     cap = min(cap_total, cap_free)
-    job = make_job(cap, max(1, min(100, args.cpu_pct)))
+    job, cpu_cap_applied = make_job(cap, max(1, min(100, args.cpu_pct)))
     out = open(args.log, "ab", buffering=0) if args.log else None
     started = time.perf_counter()
 
@@ -176,6 +199,9 @@ def main() -> int:
            f"(min({args.ram_pct}% от {total/1e9:.1f} ГБ, {args.ram_free_pct}% от свободных "
            f"{avail/1e9:.1f} ГБ)), CPU cap {args.cpu_pct}% "
            f"({max(1, args.cpu_pct*cpu_count()//100)} из {cpu_count()} ядер)")
+    if args.cpu_pct < 100 and not cpu_cap_applied:
+        report("[limited_run] ВНИМАНИЕ: жёсткий потолок CPU НЕ применён "
+               "(SetInformationJobObject вернул ошибку); лимит памяти действует.")
     try:
         # Процесс создаётся ПРИОСТАНОВЛЕННЫМ: лимит памяти должен действовать
         # с первого байта его адресного пространства, а не после первого
@@ -188,8 +214,14 @@ def main() -> int:
         return 2
     ok, error = assign(job, process.pid)
     if not ok:
+        if not args.allow_unlimited:
+            report(f"[limited_run] ОШИБКА: не удалось назначить процесс в job object (Win32 {error}); "
+                   "лимит памяти НЕ применён, запуск отменён (используйте --allow-unlimited, "
+                   "только если осознанно принимаете риск OOM).")
+            process.kill()
+            return 3
         report(f"[limited_run] ВНИМАНИЕ: не удалось назначить job object (Win32 {error}) — "
-               "лимит памяти НЕ применён")
+               "лимит памяти НЕ применён (--allow-unlimited)")
         try:
             ctypes.windll.ntdll.NtResumeProcess(process._handle)
         except Exception:                                   # noqa: BLE001

@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
+import tempfile
 import time
 
 from ziwago.evaluation.gates import (
@@ -16,6 +18,25 @@ from train_ziwago_v14_pure_synaptic_dialogue import TokenizedDialogPair
 from ziwago.organism_core import ROOT
 from ziwago.organism.verified import accept_candidate, file_sha256, stable_hash
 from ziwago_assistant import ZiwagoBiologicalSNNAssistant
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    """Записать JSON атомарно: temp в том же каталоге + fsync + os.replace.
+
+    Длинные прогоны убиваются рантаймом (~40 мин); обычный `write_text` мог
+    оставить обрезанный файл прогресса, и по нему нельзя было понять стадию.
+    """
+    path = Path(path)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp = Path(temporary)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def load_splits(dataset: Path, acceptance: Path, acceptance_mode: str = "closed_book", *,
@@ -94,7 +115,9 @@ def evaluate_frozen_acceptance(assistant, train: list[dict], cases: list[dict], 
 
     known_records = [item for item in train + assistant.genesis.authority.records + assistant.organism.language_memory_records
                      if item.get("split", "train") == "train"]
-    ranker_metadata = acceptance_ranker_metadata(assistant.genesis)
+    # Режим обязан попасть в гейт: без него open_book-проверка реестра ранкера
+    # здесь никогда не срабатывала (дефолт — closed_book).
+    ranker_metadata = acceptance_ranker_metadata(assistant.genesis, mode)
     ranker_families = {family for key in ("fit_family_ids", "internal_dev_family_ids", "calibration_family_ids")
                        for family in ranker_metadata.get(key, [])}
     known_families = {item.get("family_id") for item in known_records if item.get("family_id")} | ranker_families
@@ -275,7 +298,7 @@ def run_training(dataset: Path, acceptance: Path, output_dir: Path = ROOT / "Pro
     progress = {"version": f"{runtime_version}.0", "stage": "baseline_measured",
                 "source_hashes": source_hashes, "diagnostics": diagnostics}
     progress.update(physiology_report())
-    progress_path.write_text(json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_json_atomic(progress_path, progress)
     print(json.dumps({"stage": "baseline_measured", "progress_path": str(progress_path)}, ensure_ascii=False), flush=True)
     for epoch in range(epochs):
         for item in train:
@@ -356,7 +379,7 @@ def run_training(dataset: Path, acceptance: Path, output_dir: Path = ROOT / "Pro
                          "last_sleep": {k: v for k, v in epoch_sleep.items() if k != "rem"},
                          "rem": epoch_sleep.get("rem"),
                          "learning_counts": learning_counts})
-        progress_path.write_text(json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8")
+        _write_json_atomic(progress_path, progress)
         print(json.dumps({"stage": "epoch_finished", "epoch": epoch + 1, "learning_counts": learning_counts}), flush=True)
     diagnostics["after"] = {"train": measure_language_diagnostics(assistant, train, "train"),
                              "heldout": measure_language_diagnostics(assistant, cases, "heldout")}
@@ -403,7 +426,7 @@ def run_training(dataset: Path, acceptance: Path, output_dir: Path = ROOT / "Pro
         json.dump(result, stream, indent=2, ensure_ascii=False)
     progress.update({"stage": "completed", "report_path": str(report_path), "candidate_sha256": saved["sha256"],
                      "acceptance_passed": bool(report.get("passed"))})
-    progress_path.write_text(json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_json_atomic(progress_path, progress)
     return result
 
 
